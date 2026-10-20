@@ -1,0 +1,484 @@
+name: Stage50 ZettaBridge real build and reproducible diagnostics
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 160
+    env:
+      ZB_BASE: d6066b9b9e61de27041ba6e1f3c499c080c9e2b7
+      ZB_PR9: 897daa504b93bbe8cf46f0112cbd2bf8ea0048e8
+      ZB_PR10: b876a7abb9db8450a6c886324336a347de8a14b4
+      NDK_VERSION: 29.0.14206865
+      NDK_HOST: linux-x86_64
+    steps:
+      - name: Initialize persistent logs and runner capacity report
+        run: |
+          set -euo pipefail
+          mkdir -p build-logs
+          df -h . | tee build-logs/disk-before.txt
+          uname -a | tee build-logs/runner.txt
+
+      - name: Install Linux build dependencies
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y git clang cmake ninja-build curl unzip e2fsprogs libboost-dev python3 openjdk-17-jdk-headless
+          df -h .
+
+      - name: Install Android SDK and NDK
+        uses: android-actions/setup-android@v4
+        with:
+          packages: 'platform-tools'
+
+      - name: Install Android platform and pinned NDK
+        id: android_sdk
+        run: |
+          set -euo pipefail
+          sdkmanager --install 'platforms;android-35' 'build-tools;35.0.0' "ndk;${NDK_VERSION}"
+          sdkroot="${ANDROID_SDK_ROOT:-${ANDROID_HOME:?ANDROID SDK missing}}"
+          echo "ANDROID_SDK_ROOT=$sdkroot" >> "$GITHUB_ENV"
+          echo "NDK=$sdkroot/ndk/${NDK_VERSION}" >> "$GITHUB_ENV"
+          echo "JAVA_HOME=/usr/lib/jvm/java-17-openjdk-amd64" >> "$GITHUB_ENV"
+
+      - name: Clone baseline and verify exact PR commits
+        id: integration
+        run: |
+          set -euo pipefail
+          exec > >(tee -a build-logs/integration.txt) 2>&1
+          git clone --no-checkout https://github.com/ZailoxTT/ZettaBridge.git zettabridge
+          cd zettabridge
+          git fetch origin \
+            '+refs/pull/9/head:refs/remotes/origin/stage50-pr9' \
+            '+refs/pull/10/head:refs/remotes/origin/stage50-pr10'
+          test "$(git rev-parse refs/remotes/origin/stage50-pr9)" = "$ZB_PR9"
+          test "$(git rev-parse refs/remotes/origin/stage50-pr10)" = "$ZB_PR10"
+          git merge-base --is-ancestor "$ZB_BASE" "$ZB_PR9"
+          git merge-base --is-ancestor "$ZB_BASE" "$ZB_PR10"
+          test "$(git rev-list --count "$ZB_BASE..$ZB_PR9")" = 1
+          test "$(git rev-list --count "$ZB_BASE..$ZB_PR10")" = 1
+          git switch -c stage50-integrated "$ZB_BASE"
+          git -c user.name=Stage50 -c user.email=stage50@local.invalid cherry-pick "$ZB_PR9"
+          git -c user.name=Stage50 -c user.email=stage50@local.invalid cherry-pick "$ZB_PR10"
+          git diff --name-only "$ZB_BASE" HEAD | LC_ALL=C sort > stage50-changes.txt
+          cat stage50-changes.txt | tee ../build-logs/changed-files.txt
+          git log --format='%H %s' -3 | tee ../build-logs/integrated-commits.txt
+          git status --porcelain=v1 | tee ../build-logs/after-integration-status.txt
+          test -f guest/opensles/opensles.c
+          test -f guest/stubs/extra/libandroid_extra.c
+          git submodule update --init --recursive
+          printf 'BASE=%s\nPR9=%s\nPR10=%s\nHEAD=%s\n' "$ZB_BASE" "$ZB_PR9" "$ZB_PR10" "$(git rev-parse HEAD)" > stage50-commit-info.txt
+
+      - name: Apply Dynarmic patches
+        id: dynarmic
+        working-directory: zettabridge
+        run: |
+          set -euo pipefail
+          exec > >(tee -a ../build-logs/dynarmic.txt) 2>&1
+          for p in ../patches/dynarmic-0001-thumb32-armv8.patch ../patches/dynarmic-0002-asimd-narrowing.patch; do
+            if git -C third_party/dynarmic apply --check "$p"; then
+              git -C third_party/dynarmic apply "$p"
+            elif git -C third_party/dynarmic apply --reverse --check "$p"; then
+              echo "Already patched: $p"
+            else
+              echo "Cannot apply Dynarmic patch: $p" >&2
+              exit 1
+            fi
+          done
+
+      - name: Download Android 32-bit guest sysroot from verified Google GSI
+        id: guest_sysroot
+        working-directory: zettabridge
+        run: |
+          set -euo pipefail
+          tools/extract_sysroot.sh 2>&1 | tee ../build-logs/sysroot.txt
+          test -s sysroot/system/lib/libstdc++.so
+          readelf -h sysroot/system/lib/libstdc++.so | grep -q 'Machine:.*ARM'
+          # The unpacked GSI is unnecessary after sysroot extraction.
+          du -sh .cache/gsi 2>/dev/null || true
+          rm -f .cache/gsi/system.img .cache/gsi/gsi.zip
+          df -h . | tee ../build-logs/disk-after-gsi.txt
+
+      - name: Add verified legacy FMOD SL_IID_RECORD identifier to PR9
+        id: record_compat
+        working-directory: zettabridge
+        run: |
+          set -euo pipefail
+          exec > >(tee -a ../build-logs/record-compat.txt) 2>&1
+          python3 - <<'PY'
+          from pathlib import Path
+          import subprocess
+          p=Path('guest/opensles/opensles.c')
+          expected='8ff1a7d20f98112988fccca553cefdc58d7693bd'
+          current=subprocess.check_output(['git','hash-object',str(p)],text=True).strip()
+          if current != expected:
+              raise SystemExit('PR9 OpenSL source changed; refusing unreviewed patch: '+current)
+          text=p.read_text(encoding='utf-8')
+          anchor='IID(SL_IID_ANDROIDCONFIGURATION, 0x89f6a7e0, 0xbeac, 0x11df, 0x11)\n'
+          if text.count(anchor)!=1 or 'SL_IID_RECORD_value' in text or text.count('static int iid_eq(')!=1:
+              raise SystemExit('OpenSL patch anchor or idempotency check failed')
+          addition='''\n/* Khronos OpenSL ES 1.0.1 standard interface ID; no recording behavior. */\nstatic const struct SLInterfaceID_ SL_IID_RECORD_value = {\n    0xc5657aa0, 0xdddb, 0x11db, 0x82f7,\n    { 0x00, 0x02, 0xa5, 0xd5, 0xc5, 0x1b }\n};\nEXPORT const SLInterfaceID SL_IID_RECORD = &SL_IID_RECORD_value;\n'''
+          p.write_text(text.replace(anchor,anchor+addition,1),encoding='utf-8')
+          print('PR9 record identifier exported, recording functionality remains unsupported')
+          PY
+
+      - name: Stage50 CP15 ARMv7 CNTVCT virtual timer fix
+        id: cp15_timer
+        working-directory: zettabridge
+        run: |
+          set -euo pipefail
+          exec > >(tee -a ../build-logs/cp15-timer.txt) 2>&1
+          python3 - . <<'PY'
+          #!/usr/bin/env python3
+          """Add ARMv7 CP15 generic-timer emulation to pinned ZettaBridge cp15.cpp.
+          
+          This does not alter any guest APK. It is for integration with ZettaBridge commit
+           d6066b9 plus pinned PR9/10. Refuse unknown source revisions and re-application.
+          """
+          from __future__ import annotations
+          import argparse
+          from pathlib import Path
+          import subprocess
+          
+          EXPECTED_BLOB = 'f4b5290a8fd939037d8570d42dbea48b49072260'
+          SRC = Path('core/src/cp15.cpp')
+          
+          # Keep 1 GHz virtual CNTFRQ equal to nanoseconds returned by CLOCK_MONOTONIC.
+          TIMER_HELPERS = '''// ARMv7 generic timer for legacy applications.  MRRC p15, 1, Rt, Rt2, c14
+          // reads CNTVCT, and MRC p15, 0, Rt, c14, c0, 0 reads CNTFRQ.
+          // Provide a consistent 1 GHz virtual counter/frequency pair rather than executing
+          // privileged guest instructions on the host.  This is a clock, NOT random entropy.
+          constexpr std::uint32_t kVirtualCounterHz = 1000000000U;
+          
+          std::uint64_t read_virtual_counter(void*, std::uint32_t, std::uint32_t) {
+              timespec now{};
+              if (clock_gettime(CLOCK_MONOTONIC, &now) != 0) return 0;
+              return static_cast<std::uint64_t>(now.tv_sec) * kVirtualCounterHz +
+                     static_cast<std::uint64_t>(now.tv_nsec);
+          }
+          
+          std::uint64_t read_virtual_counter_hz(void*, std::uint32_t, std::uint32_t) {
+              return kVirtualCounterHz;
+          }
+          
+          '''
+          
+          REPLACE_GET_ONE = '''Cp15::CallbackOrAccessOneWord Cp15::CompileGetOneWord(bool two, unsigned opc1, CoprocReg CRn, CoprocReg CRm, unsigned opc2) {
+              if (!two && opc1 == 0 && CRn == CoprocReg::C14 && CRm == CoprocReg::C0 && opc2 == 0) {
+                  return Callback{&read_virtual_counter_hz, std::nullopt};
+              }
+              if (is_thread_id_reg(two, opc1, CRn, CRm)) {'''
+          
+          REPLACE_GET_TWO = '''Cp15::CallbackOrAccessTwoWords Cp15::CompileGetTwoWords(bool two, unsigned opc, CoprocReg CRm) {
+              if (!two && opc == 1 && CRm == CoprocReg::C14) {
+                  return Callback{&read_virtual_counter, std::nullopt};
+              }
+              return std::monostate{};
+          }'''
+          
+          
+          def transform(text: str) -> str:
+              if 'kVirtualCounterHz' in text:
+                  raise ValueError('already patched: virtual CP15 counter exists')
+              pairs = [
+                  ('#include <atomic>\n', '#include <atomic>\n#include <time.h>\n'),
+                  ('std::uint64_t run_barrier(void*, std::uint32_t, std::uint32_t) {',
+                   TIMER_HELPERS + 'std::uint64_t run_barrier(void*, std::uint32_t, std::uint32_t) {'),
+                  ('Cp15::CallbackOrAccessOneWord Cp15::CompileGetOneWord(bool two, unsigned opc1, CoprocReg CRn, CoprocReg CRm, unsigned opc2) {\n    if (is_thread_id_reg(two, opc1, CRn, CRm)) {', REPLACE_GET_ONE),
+                  ('Cp15::CallbackOrAccessTwoWords Cp15::CompileGetTwoWords(bool, unsigned, CoprocReg) {\n    return std::monostate{};\n}', REPLACE_GET_TWO),
+              ]
+              for old, new in pairs:
+                  if text.count(old) != 1:
+                      raise ValueError(f'expected exactly one source anchor, found {text.count(old)}: {old[:75]!r}')
+                  text = text.replace(old, new, 1)
+              return text
+          
+          
+          def main() -> None:
+              p = argparse.ArgumentParser()
+              p.add_argument('zettabridge', type=Path, help='Root of pinned ZettaBridge checkout')
+              p.add_argument('--dry-run', action='store_true')
+              args = p.parse_args()
+              target = args.zettabridge / SRC
+              if not target.is_file():
+                  raise SystemExit(f'missing source: {target}')
+              current = subprocess.check_output(['git', 'hash-object', str(target)], text=True).strip()
+              if current != EXPECTED_BLOB:
+                  raise SystemExit(f'Unexpected cp15.cpp blob: {current}, expected {EXPECTED_BLOB}; refusing edit')
+              original = target.read_text(encoding='utf-8')
+              updated = transform(original)
+              if not args.dry_run:
+                  target.write_text(updated, encoding='utf-8')
+              print(f'Stage50 CP15 timer patch {"DRY RUN" if args.dry_run else "APPLIED"}: {target}')
+          
+          
+          if __name__ == '__main__':
+              main()
+          PY
+
+      - name: Build ARM32 guest and verify OpenSL ES and NativeActivity
+        id: guest
+        working-directory: zettabridge
+        run: |
+          set -euo pipefail
+          exec > >(tee -a ../build-logs/guest-stage.txt) 2>&1
+          NDK="$NDK" NDK_HOST="$NDK_HOST" tools/build_guest.sh 2>&1 | tee ../build-logs/arm32.txt
+          for item in \
+            'libOpenSLES.so slCreateEngine' \
+            'libOpenSLES.so SL_IID_RECORD' \
+            'libandroid.so ANativeActivity_finish' \
+            'libzbjni.so JNI_GetCreatedJavaVMs'; do
+            read -r lib symbol <<< "$item"
+            file="build/guest/lib/$lib"
+            test -s "$file"
+            readelf -h "$file" | grep -q 'Machine:.*ARM'
+            readelf -W --dyn-syms "$file" | awk -v x="$symbol" '$7 != "UND" && $8 == x { found=1 } END { exit !found }'
+            echo "PASS ARM32: $lib exports $symbol"
+          done
+
+      - name: Build ARM64 translator and JNI proxy
+        id: arm64
+        working-directory: zettabridge
+        run: |
+          set -euo pipefail
+          exec > >(tee -a ../build-logs/arm64-stage.txt) 2>&1
+          # Cross-compiling with NDK clang: /usr/include is treated as an implicit
+          # host include directory and can be dropped from compile commands.
+          # Use a dedicated non-system include path for the header-only Boost.Icl.
+          test -f /usr/include/boost/icl/interval_map.hpp
+          mkdir -p build/boost-headers
+          ln -sfn /usr/include/boost build/boost-headers/boost
+          test -f build/boost-headers/boost/icl/interval_map.hpp
+          cmake -S . -B build/android-arm64 -G Ninja \
+            -DCMAKE_TOOLCHAIN_FILE="$NDK/build/cmake/android.toolchain.cmake" \
+            -DANDROID_ABI=arm64-v8a -DANDROID_PLATFORM=android-29 \
+            -DCMAKE_BUILD_TYPE=Release -DZB_BUILD_TESTS=OFF \
+            -DBoost_INCLUDE_DIR="$PWD/build/boost-headers"
+          ninja -C build/android-arm64 zbridge zbproxy 2>&1 | tee ../build-logs/arm64.txt
+          readelf -h build/android-arm64/core/libzbridge.so | grep -q 'Machine:.*AArch64'
+          readelf -h build/android-arm64/core/libzbproxy.so | grep -q 'Machine:.*AArch64'
+
+      - name: Package runtime and assemble debug launcher APK
+        id: launcher
+        working-directory: zettabridge
+        run: |
+          set -euo pipefail
+          exec > >(tee -a ../build-logs/launcher-stage.txt) 2>&1
+          tools/make_launcher_bundle.sh
+          (cd android/launcher && bash gradlew --no-daemon :app:assembleDebug) 2>&1 | tee ../build-logs/gradle.txt
+          test -s android/launcher/app/build/outputs/apk/debug/app-debug.apk
+          "$ANDROID_SDK_ROOT/build-tools/35.0.0/apksigner" verify --verbose \
+            --min-sdk-version 35 android/launcher/app/build/outputs/apk/debug/app-debug.apk \
+            2>&1 | tee ../build-logs/apksigner.txt
+          sha256sum android/launcher/app/build/outputs/apk/debug/app-debug.apk > stage50-launcher-sha256.txt
+
+      - name: Stage50 artifact gate (ARM32/ARM64, JNI, native activity, transitive dependencies)
+        id: apk_gate
+        run: |
+          set -euo pipefail
+          python3 - <<'PY' 2>&1 | tee build-logs/apk-gate.txt
+          #!/usr/bin/env python3
+          """Stage50 ZettaBridge ARM64 launcher / ARM32 guest build-artifact gate.
+          Checks real packaged ELF machine types and NativeActivity/OpenSL/JNI exports.
+          Not an Android device startup test. No third-party game is uploaded or modified.
+          """
+          from __future__ import annotations
+          import argparse
+          import io
+          import json
+          import pathlib
+          import re
+          import shutil
+          import struct
+          import subprocess
+          import sys
+          import tempfile
+          import zipfile
+          
+          SYSTEM = ["system/bin/linker", "system/lib/ld-android.so", "system/lib/libc++.so", "system/lib/libc.so", "system/lib/libdl_android.so", "system/lib/libdl.so", "system/lib/liblog.so", "system/lib/libm.so", "system/lib/libstdc++.so", "system/lib/libz.so"]
+          GUEST = ["libzbcompat.so", "libzbjni.so", "libGLESv2.so", "libGLESv1_CM.so", "libEGL.so", "libandroid.so", "libjnigraphics.so", "libOpenSLES.so"]
+          EXPORTS = {
+              "assets/zb/guest/lib/libOpenSLES.so": ["slCreateEngine", "SL_IID_RECORD"],
+              "assets/zb/guest/lib/libandroid.so": ["ANativeActivity_finish"],
+              "assets/zb/guest/lib/libzbjni.so": ["JNI_GetCreatedJavaVMs"],
+              "assets/zb/host/libzbproxy.so": ["ANativeActivity_onCreate", "JNI_OnLoad"],
+          }
+          RUNTIME = {"assets/zb/sysroot/" + x: (1, 40) for x in SYSTEM}
+          RUNTIME.update({"assets/zb/guest/lib/" + x: (1, 40) for x in GUEST})
+          RUNTIME.update({"assets/zb/guest/zbhost": (1,40), "assets/zb/host/libzbproxy.so": (2,183), "lib/arm64-v8a/libzbridge.so": (2,183)})
+          
+          
+          def inspect(apk: pathlib.Path) -> dict:
+              result={"apk":str(apk), "ok":False,"checks":[],"errors":[],"runtime_libraries":{},"needed":{}}
+              def ok(message): result["checks"].append(message)
+              def err(message): result["errors"].append(message)
+              if not apk.is_file():
+                  err("missing APK")
+                  return result
+              if shutil.which("readelf") is None:
+                  err("readelf unavailable")
+                  return result
+              try:
+                  with zipfile.ZipFile(apk) as z:
+                      names=set(z.namelist())
+                      if "AndroidManifest.xml" not in names: err("missing AndroidManifest.xml")
+                      if "classes.dex" not in names: err("missing classes.dex")
+                      native=[n for n in names if n.startswith("lib/") and n.endswith(".so")]
+                      invalid=[n for n in native if not n.startswith("lib/arm64-v8a/")]
+                      if invalid: err("wrong host ABI in APK native lib/: " + ",".join(sorted(invalid)))
+                      for n,(clazz,machine) in sorted(RUNTIME.items()):
+                          if n not in names:
+                              err("missing runtime component: "+n)
+                              continue
+                          data=z.read(n)
+                          if len(data)<20 or data[:4]!=b"\x7fELF" or data[5]!=1 or data[4]!=clazz or struct.unpack_from("<H",data,18)[0]!=machine:
+                              err("wrong ELF architecture: "+n)
+                              continue
+                          result["runtime_libraries"][n]="ELF32/ARM" if clazz==1 else "ELF64/AArch64"
+                      with tempfile.TemporaryDirectory(prefix="stage50-elf-") as t:
+                          for n,symbols in EXPORTS.items():
+                              if n not in result["runtime_libraries"]: continue
+                              p=pathlib.Path(t)/n.rsplit("/",1)[-1]
+                              p.write_bytes(z.read(n))
+                              cmd=subprocess.run(["readelf","-W","--dyn-syms",str(p)],capture_output=True,text=True)
+                              if cmd.returncode: err("readelf failed for "+n);continue
+                              found=set()
+                              for line in cmd.stdout.splitlines():
+                                  cols=line.split()
+                                  if len(cols)>=8 and cols[0].endswith(":") and cols[6]!="UND":
+                                      found.add(cols[7].split("@")[0])
+                              for symbol in symbols:
+                                  if symbol in found: ok(n+" exports "+symbol)
+                                  else: err(n+" does not export "+symbol)
+                      # Verify bundler file manifest and version hash, not just ELF paths.
+                      # make_launcher_bundle.sh uses: sha256sum <file> for every sorted zb path,
+                      # then sha256sum of that command's entire text output.
+                      listing_name="assets/zb-files.txt"
+                      version_name="assets/zb-version.txt"
+                      if listing_name not in names or version_name not in names:
+                          err("missing runtime inventory or bundle fingerprint")
+                      else:
+                          import hashlib
+                          inventory=z.read(listing_name).decode("utf-8").splitlines()
+                          expected=sorted(n[7:] for n in names if n.startswith("assets/zb/"))
+                          if inventory != expected or len(set(inventory)) != len(inventory):
+                              err("zb-files.txt inventory does not match packaged runtime")
+                          else:
+                              hashed="".join(hashlib.sha256(z.read("assets/"+n)).hexdigest()+"  "+n+"\n" for n in inventory)
+                              expected_version=hashlib.sha256(hashed.encode("utf-8")).hexdigest()
+                              actual_version=z.read(version_name).decode("utf-8").strip()
+                              if actual_version != expected_version:
+                                  err("zb-version.txt fingerprint mismatch")
+                              else:
+                                  ok("runtime inventory and SHA256 fingerprint verified")
+                      # Read guest dynamic dependencies. If a runtime library requires a missing dependency,
+                      # it will not load; compare against all guest + system 32-bit libraries.
+                      guest_sonames={x.rsplit("/",1)[-1] for x in RUNTIME if x.startswith("assets/zb/guest/lib/") or x.startswith("assets/zb/sysroot/system/lib/")}
+                      for n in sorted(x for x in RUNTIME if x.startswith("assets/zb/guest/lib/")):
+                          if n not in result["runtime_libraries"]: continue
+                          with tempfile.TemporaryDirectory(prefix="stage50-needed-") as t:
+                              p=pathlib.Path(t)/n.rsplit("/",1)[-1]
+                              p.write_bytes(z.read(n))
+                              cmd=subprocess.run(["readelf","-W","-d",str(p)],capture_output=True,text=True)
+                              if cmd.returncode: err("cannot parse ELF dynamic section: "+n);continue
+                              needed=re.findall(r"\(NEEDED\).*?\[([^\]]+)\]",cmd.stdout)
+                              result["needed"][n]=needed
+                              for lib in needed:
+                                  if lib not in guest_sonames: err(n+" requires missing 32-bit dependency "+lib)
+                      # A debug launcher is not a recompiled 64-bit Craftsman APK.
+                      if "lib/armeabi-v7a/libminecraftpe.so" in names:
+                          err("game engine mistakenly embedded in launcher")
+                      if not result["errors"]: ok("all required architecture/export/dependency checks passed")
+              except (OSError,zipfile.BadZipFile,RuntimeError) as exc:
+                  err(type(exc).__name__+": "+str(exc))
+              result["ok"]=not result["errors"]
+              return result
+          
+          
+          def main():
+              ap=argparse.ArgumentParser()
+              ap.add_argument("apk",type=pathlib.Path)
+              ap.add_argument("--report",type=pathlib.Path)
+              a=ap.parse_args()
+              result=inspect(a.apk)
+              blob=json.dumps(result,ensure_ascii=False,indent=2)+"\n"
+              if a.report:
+                  a.report.parent.mkdir(parents=True,exist_ok=True)
+                  a.report.write_text(blob,encoding="utf-8")
+              print("\n".join(["PASS " + s for s in result["checks"]]+["FAIL "+s for s in result["errors"]]))
+              print("STAGE44_GATE="+("PASS" if result["ok"] else "FAIL"))
+              raise SystemExit(0 if result["ok"] else 1)
+          from pathlib import Path
+          target=Path("zettabridge/android/launcher/app/build/outputs/apk/debug/app-debug.apk")
+          report=inspect(target)
+          Path("build-logs/apk-gate.json").write_text(json.dumps(report,indent=2)+"\n")
+          for issue in report["errors"]: print("ERROR",issue)
+          print("Stage50 APK gate PASS" if report["ok"] else "Stage50 APK gate FAIL")
+          if not report["ok"]: raise SystemExit(1)
+          PY
+
+      - name: Write CI outcome summary even if an earlier build step failed
+        if: always()
+        env:
+          INTEGRATION: ${{ steps.integration.outcome }}
+          ANDROID_SDK: ${{ steps.android_sdk.outcome }}
+          DYNARMIC: ${{ steps.dynarmic.outcome }}
+          SYSROOT: ${{ steps.guest_sysroot.outcome }}
+          RECORD_COMPAT: ${{ steps.record_compat.outcome }}
+          CP15_TIMER: ${{ steps.cp15_timer.outcome }}
+          ARM32: ${{ steps.guest.outcome }}
+          ARM64: ${{ steps.arm64.outcome }}
+          LAUNCHER: ${{ steps.launcher.outcome }}
+          GATE: ${{ steps.apk_gate.outcome }}
+        run: |
+          mkdir -p build-logs
+          python3 - <<'PY'
+          import json, os
+          from pathlib import Path
+          d={k:os.environ.get(k,'unknown') for k in ('INTEGRATION','ANDROID_SDK','DYNARMIC','SYSROOT','RECORD_COMPAT','CP15_TIMER','ARM32','ARM64','LAUNCHER','GATE')}
+          d['craftsman_game_started']=False
+          d['device_tested']=False
+          d['is_native_arm64_port']=False
+          d['is_actual_ci_build']=True
+          d['runner_os']=os.environ.get('RUNNER_OS','unknown')
+          Path('build-logs/outcomes.json').write_text(json.dumps(d,indent=2)+'\n')
+          with Path(os.environ['GITHUB_STEP_SUMMARY']).open('a') as f:
+              f.write('## Stage50 - ZettaBridge build\n\n')
+              for k,v in d.items(): f.write(f'- {k}: `{v}`\n')
+              f.write('\nThese are build stages, NOT proof the Craftsman game starts.\n')
+          PY
+          df -h . | tee build-logs/disk-final.txt
+
+      - name: Upload debug launcher APK (on build success)
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: stage50-zettabridge-debug-launcher
+          path: |
+            zettabridge/android/launcher/app/build/outputs/apk/debug/app-debug.apk
+            zettabridge/stage50-launcher-sha256.txt
+            build-logs/outcomes.json
+            zettabridge/stage50-commit-info.txt
+            zettabridge/stage50-changes.txt
+            zettabridge/LICENSE
+          retention-days: 14
+
+      - name: Upload integration metadata and build diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: stage50-build-diagnostics
+          if-no-files-found: warn
+          path: |
+            build-logs/
+            zettabridge/stage50-commit-info.txt
+            zettabridge/stage50-changes.txt
+            zettabridge/stage50-launcher-sha256.txt
+            build-logs/outcomes.json
+            zettabridge/android/launcher/app/build/outputs/logs/
+          retention-days: 14
